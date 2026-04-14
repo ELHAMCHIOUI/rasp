@@ -1,15 +1,14 @@
 import os
 import json
 import time
+import serial
 import requests
 from skyfield.api import EarthSatellite, load, wgs84
 
-# ── CelesTrak endpoint (current as of 2025) ───────────────────────────────────
+# ── CelesTrak endpoint ────────────────────────────────────────────────────────
 CELESTRAK_URL = "https://celestrak.org/NORAD/elements/gp.php"
 
 # ── TLE cache settings ────────────────────────────────────────────────────────
-# CelesTrak updates data ~3 times per day, so 2 hours is the recommended
-# minimum cache duration. Fetching more often risks IP throttling/blocking.
 TLE_CACHE_FILE    = "/tmp/tle_cache.json"
 TLE_CACHE_MAX_AGE = 7200   # seconds (2 hours)
 
@@ -17,22 +16,54 @@ ts = load.timescale()
 
 
 # =============================================================================
-#  TLE FETCHER  — with caching, proper User-Agent, and stale-cache fallback
+#  ARDUINO SERIAL
+# =============================================================================
+
+def open_serial(port: str, baudrate: int = 9600, timeout: float = 1.0) -> serial.Serial:
+    """Open serial connection to Arduino."""
+    try:
+        ser = serial.Serial(port, baudrate=baudrate, timeout=timeout)
+        time.sleep(2)  # Wait for Arduino to reset after serial connection
+        print(f"  [Serial] Connected to Arduino on {port} @ {baudrate} baud")
+        return ser
+    except serial.SerialException as e:
+        raise RuntimeError(f"Cannot open serial port {port}: {e}")
+
+
+def send_goto(ser: serial.Serial, azimuth: float, elevation: float):
+    """
+    Send a GOTO command to the Arduino rotator controller.
+    Format: GOTO:<azimuth>:<elevation>\n
+    Example: GOTO:182.45:34.12
+    """
+    # Clamp elevation to physically meaningful range
+    elevation = max(0.0, min(90.0, elevation))
+    azimuth   = azimuth % 360.0
+
+    cmd = f"GOTO:{azimuth:.2f}:{elevation:.2f}\n"
+    try:
+        ser.write(cmd.encode("utf-8"))
+        ser.flush()
+        print(f"  [Serial] Sent → {cmd.strip()}")
+
+        # Optional: read ACK from Arduino (remove if your firmware doesn't reply)
+        ack = ser.readline().decode("utf-8", errors="replace").strip()
+        if ack:
+            print(f"  [Serial] ACK  ← {ack}")
+
+    except serial.SerialException as e:
+        print(f"  [Serial] ⚠️  Write error: {e}")
+
+
+# =============================================================================
+#  TLE FETCHER
 # =============================================================================
 
 def fetch_tle(norad_id: int):
-    """
-    Récupère les TLE depuis CelesTrak avec:
-      - Un header User-Agent correct (évite les blocages silencieux)
-      - Un timeout de 30 s (CelesTrak peut être lent)
-      - Un cache local JSON valide 2 heures (évite le throttling)
-      - Un fallback sur le cache périmé si le réseau est indisponible
-    """
     cache     = {}
     cache_key = str(norad_id)
     now       = time.time()
 
-    # ── Charger le cache local si disponible ─────────────────────────────────
     if os.path.exists(TLE_CACHE_FILE):
         try:
             with open(TLE_CACHE_FILE, "r") as f:
@@ -40,112 +71,75 @@ def fetch_tle(norad_id: int):
         except Exception:
             cache = {}
 
-    # ── Retourner le cache s'il est encore frais ──────────────────────────────
     if cache_key in cache:
         entry = cache[cache_key]
         age   = now - entry.get("fetched_at", 0)
         if age < TLE_CACHE_MAX_AGE:
-            print(f"  [TLE] Cache local utilisé pour NORAD {norad_id} "
-                  f"(âge : {age/60:.0f} min)")
+            print(f"  [TLE] Cache hit for NORAD {norad_id} (age: {age/60:.0f} min)")
             return entry["name"], entry["tle1"], entry["tle2"]
 
-    # ── Requête vers CelesTrak ────────────────────────────────────────────────
-    print(f"  [TLE] Téléchargement depuis CelesTrak (NORAD {norad_id})...")
-    headers = {
-        # Un User-Agent identifiable est requis — les requêtes anonymes
-        # sont parfois bloquées silencieusement par le serveur CelesTrak.
-        "User-Agent": "SatelliteTracker/1.0 (educational project)"
-    }
-    params = {"CATNR": norad_id, "FORMAT": "tle"}
+    print(f"  [TLE] Fetching from CelesTrak (NORAD {norad_id})...")
+    headers = {"User-Agent": "SatelliteTracker/1.0 (educational project)"}
+    params  = {"CATNR": norad_id, "FORMAT": "tle"}
 
     try:
-        resp = requests.get(
-            CELESTRAK_URL,
-            params=params,
-            headers=headers,
-            timeout=30          # 30 s — CelesTrak peut être lent
-        )
+        resp = requests.get(CELESTRAK_URL, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
 
-        # Réponse explicite de CelesTrak quand le NORAD ID est inconnu
         if "No GP data found" in resp.text:
-            raise ValueError(
-                f"NORAD {norad_id} introuvable sur CelesTrak. "
-                f"Vérifiez l'identifiant."
-            )
+            raise ValueError(f"NORAD {norad_id} not found on CelesTrak.")
 
         lines = [ln.strip() for ln in resp.text.splitlines() if ln.strip()]
         if len(lines) < 2:
-            raise ValueError(
-                f"Format TLE inattendu pour NORAD {norad_id}:\n{resp.text}"
-            )
+            raise ValueError(f"Unexpected TLE format for NORAD {norad_id}:\n{resp.text}")
 
         if not lines[0].startswith("1 "):
             name, tle1, tle2 = lines[0], lines[1], lines[2]
         else:
             name, tle1, tle2 = f"NORAD {norad_id}", lines[0], lines[1]
 
-        # ── Sauvegarder dans le cache ─────────────────────────────────────────
-        cache[cache_key] = {
-            "name": name, "tle1": tle1, "tle2": tle2,
-            "fetched_at": now
-        }
+        cache[cache_key] = {"name": name, "tle1": tle1, "tle2": tle2, "fetched_at": now}
         try:
             with open(TLE_CACHE_FILE, "w") as f:
                 json.dump(cache, f, indent=2)
         except Exception:
-            pass   # Échec d'écriture non fatal
+            pass
 
         print(f"  [TLE] OK — {name}")
         return name, tle1, tle2
 
     except requests.exceptions.Timeout:
-        # ── Fallback sur cache périmé ─────────────────────────────────────────
         if cache_key in cache:
             entry = cache[cache_key]
             age   = now - entry.get("fetched_at", 0)
-            print(f"  [TLE] Timeout réseau. Utilisation du cache périmé "
-                  f"(âge : {age/3600:.1f} h). Précision réduite possible.")
+            print(f"  [TLE] Timeout. Using stale cache (age: {age/3600:.1f} h).")
             return entry["name"], entry["tle1"], entry["tle2"]
-        raise RuntimeError(
-            "CelesTrak n'a pas répondu (timeout) et aucun cache disponible.\n"
-            "Vérifiez votre connexion internet et réessayez dans quelques minutes."
-        )
+        raise RuntimeError("CelesTrak timed out and no cache available.")
 
     except Exception as exc:
-        # ── Fallback sur cache périmé pour toute autre erreur ─────────────────
         if cache_key in cache:
             entry = cache[cache_key]
             age   = now - entry.get("fetched_at", 0)
-            print(f"  [TLE] Erreur : {exc}\n"
-                  f"  Utilisation du cache périmé (âge : {age/3600:.1f} h).")
+            print(f"  [TLE] Error: {exc}\n  Using stale cache (age: {age/3600:.1f} h).")
             return entry["name"], entry["tle1"], entry["tle2"]
         raise
 
 
 # =============================================================================
-#  CONSTRUCTION DU SATELLITE
+#  SATELLITE
 # =============================================================================
 
 def build_satellite(norad_id: int) -> EarthSatellite:
-    """Construit l'objet satellite Skyfield à partir des TLE."""
     name, l1, l2 = fetch_tle(norad_id)
     return EarthSatellite(l1, l2, name, ts)
 
 
-# =============================================================================
-#  CALCUL DE LA POSITION
-# =============================================================================
-
 def get_satellite_data(sat: EarthSatellite, observer):
-    """Calcule position absolue + position relative (azimut/élévation)."""
     t = ts.now()
 
-    # Position absolue du satellite (géodésique)
     geocentric = sat.at(t)
     subpoint   = wgs84.subpoint(geocentric)
 
-    # Position relative vue depuis l'observateur
     difference  = sat - observer
     topocentric = difference.at(t)
     alt, az, distance = topocentric.altaz()
@@ -163,116 +157,147 @@ def get_satellite_data(sat: EarthSatellite, observer):
 
 
 # =============================================================================
-#  SAISIE UTILISATEUR
+#  USER INPUT
 # =============================================================================
 
 def get_user_inputs():
-    """Demande les paramètres à l'utilisateur."""
     print("=" * 60)
     print("SATELLITE TRACKER - Configuration")
     print("=" * 60)
 
-    # NORAD ID
     while True:
         try:
-            norad_id = int(input(
-                "\nEntrez le NORAD ID du satellite "
-                "(ex: 25544 pour l'ISS, 63632 pour Shenzhou-20): "
-            ))
+            norad_id = int(input("\nNORAD ID (e.g. 25544 for ISS): "))
             if norad_id > 0:
                 break
-            print("❌ Le NORAD ID doit être positif.")
+            print("❌ Must be positive.")
         except ValueError:
-            print("❌ Veuillez entrer un nombre valide.")
+            print("❌ Please enter a valid number.")
 
-    # Intervalle de rafraîchissement
     while True:
         try:
-            refresh = float(input(
-                "Intervalle de rafraîchissement (en secondes, ex: 5): "
-            ))
+            refresh = float(input("Refresh interval in seconds (e.g. 5): "))
             if refresh > 0:
                 break
-            print("❌ L'intervalle doit être positif.")
+            print("❌ Must be positive.")
         except ValueError:
-            print("❌ Veuillez entrer un nombre valide.")
+            print("❌ Please enter a valid number.")
 
-    # Position de l'observateur
-    print("\n📍 Position de l'observateur:")
+    print("\n📍 Observer position:")
     while True:
         try:
-            lat = float(input("  Latitude  (ex: 48.1172 pour Rennes): "))
+            lat = float(input("  Latitude  (e.g. 48.8566 for Paris): "))
             if -90 <= lat <= 90:
                 break
-            print("❌ La latitude doit être entre -90 et 90.")
+            print("❌ Must be between -90 and 90.")
         except ValueError:
-            print("❌ Veuillez entrer un nombre valide.")
+            print("❌ Please enter a valid number.")
 
     while True:
         try:
-            lon = float(input("  Longitude (ex: -1.6778 pour Rennes): "))
+            lon = float(input("  Longitude (e.g. 2.3522 for Paris): "))
             if -180 <= lon <= 180:
                 break
-            print("❌ La longitude doit être entre -180 et 180.")
+            print("❌ Must be between -180 and 180.")
         except ValueError:
-            print("❌ Veuillez entrer un nombre valide.")
+            print("❌ Please enter a valid number.")
 
-    return norad_id, refresh, lat, lon
+    print("\n🔌 Arduino serial port:")
+    serial_port = input("  Port (e.g. COM3, /dev/ttyUSB0, /dev/ttyACM0): ").strip()
+
+    while True:
+        try:
+            baudrate = int(input("  Baudrate (e.g. 9600): ") or "9600")
+            if baudrate > 0:
+                break
+            print("❌ Must be positive.")
+        except ValueError:
+            print("❌ Please enter a valid number.")
+
+    # Option to only send GOTO when satellite is above horizon
+    visible_only = input("\nOnly send GOTO when satellite is visible? (y/N): ").strip().lower() == "y"
+
+    return norad_id, refresh, lat, lon, serial_port, baudrate, visible_only
 
 
 # =============================================================================
-#  BOUCLE PRINCIPALE
+#  MAIN LOOP
 # =============================================================================
 
 def main():
-    norad_id, refresh_seconds, lat, lon = get_user_inputs()
+    norad_id, refresh_seconds, lat, lon, serial_port, baudrate, visible_only = get_user_inputs()
 
     observer = wgs84.latlon(lat, lon)
 
-    print("\n🛰️  Récupération des données du satellite...")
+    print("\n🛰️  Fetching satellite data...")
     try:
         sat = build_satellite(norad_id)
     except Exception as e:
-        print(f"❌ Erreur lors de la récupération du satellite: {e}")
+        print(f"❌ Failed to load satellite: {e}")
+        return
+
+    print("\n🔌 Opening Arduino serial connection...")
+    try:
+        ser = open_serial(serial_port, baudrate)
+    except RuntimeError as e:
+        print(f"❌ {e}")
         return
 
     print("\n" + "=" * 60)
-    print(f"✅ Tracking: {sat.name} (NORAD {norad_id})")
-    print(f"📍 Observateur: {lat:.4f}°N, {lon:.4f}°E")
-    print(f"⏱️  Rafraîchissement: {refresh_seconds}s")
+    print(f"✅ Tracking : {sat.name} (NORAD {norad_id})")
+    print(f"📍 Observer : {lat:.4f}°N, {lon:.4f}°E")
+    print(f"⏱️  Refresh  : {refresh_seconds}s")
+    print(f"🔌 Serial   : {serial_port} @ {baudrate} baud")
+    print(f"🎯 GOTO mode: {'visible passes only' if visible_only else 'always'}")
     print("=" * 60)
-    print("\nAppuyez sur Ctrl+C pour arrêter\n")
+    print("Press Ctrl+C to stop\n")
 
-    while True:
-        try:
-            data = get_satellite_data(sat, observer)
+    try:
+        while True:
+            try:
+                data = get_satellite_data(sat, observer)
 
-            status = "✅ VISIBLE" if data["is_visible"] else "❌ SOUS L'HORIZON"
+                az   = data["azimuth_deg"]
+                elev = data["elevation_deg"]
+                vis  = data["is_visible"]
+                status = "✅ VISIBLE" if vis else "❌ BELOW HORIZON"
 
-            print(f"{data['timestamp_utc']}")
-            print(
-                f"  Position satellite: "
-                f"lat={data['latitude_deg']:7.3f}°, "
-                f"lon={data['longitude_deg']:7.3f}°, "
-                f"alt={data['altitude_km']:6.1f} km"
-            )
-            print(
-                f"  Vue observateur:   "
-                f"az={data['azimuth_deg']:6.2f}°, "
-                f"élév={data['elevation_deg']:6.2f}°, "
-                f"dist={data['distance_km']:7.1f} km"
-            )
-            print(f"  Statut: {status}")
-            print("-" * 60)
+                print(f"{data['timestamp_utc']}")
+                print(
+                    f"  Satellite : "
+                    f"lat={data['latitude_deg']:7.3f}°, "
+                    f"lon={data['longitude_deg']:7.3f}°, "
+                    f"alt={data['altitude_km']:6.1f} km"
+                )
+                print(
+                    f"  Observer  : "
+                    f"az={az:6.2f}°, "
+                    f"elev={elev:6.2f}°, "
+                    f"dist={data['distance_km']:7.1f} km"
+                )
+                print(f"  Status    : {status}")
 
-            time.sleep(refresh_seconds)
+                # ── Send GOTO to Arduino ──────────────────────────────────────
+                if not visible_only or vis:
+                    send_goto(ser, az, elev)
+                else:
+                    print("  [Serial]  Skipped (satellite not visible)")
 
-        except KeyboardInterrupt:
-            print("\n\n🛑 Arrêt du tracking.")
-            break
-        except Exception as e:
-            print(f"❌ Erreur: {e}")
-            time.sleep(refresh_seconds)
+                print("-" * 60)
+                time.sleep(refresh_seconds)
+
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                time.sleep(refresh_seconds)
+
+    except KeyboardInterrupt:
+        print("\n\n🛑 Tracking stopped.")
+    finally:
+        if ser.is_open:
+            ser.close()
+            print("🔌 Serial port closed.")
 
 
 if __name__ == "__main__":
